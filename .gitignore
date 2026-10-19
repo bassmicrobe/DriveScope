@@ -1,0 +1,16 @@
+# Local build and verification output
+/DriveScope.exe
+/artifacts/
+/verification/
+/dist/*
+!/dist/DriveScope-portable.zip
+
+# Local settings, scan results and editor state
+*.scan.gz
+*.scan.gz.tmp
+selection.txt
+*.log
+*.pdb
+*.user
+*.suo
+/.vs/
