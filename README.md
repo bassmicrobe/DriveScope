@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/branding/drivescope-logo-local.svg">
+  <img src="assets/branding/drivescope-logo-on-light-local.svg" alt="DriveScope LOCAL" width="361" height="64">
+</picture>
+
 # DriveScope
 
 接続中のドライブを自動検出し、**何に容量を使っているかをカテゴリ別に比較できるWindowsアプリ**です。調べたいドライブにチェックを付けるだけで、フォルダの内訳や大きいファイルを確認できます。
@@ -103,7 +108,7 @@ Start-Process .\DriveScope.exe
 .\package.ps1
 ```
 
-ビルドとセルフテストを実行し、成功すると `dist/DriveScope-portable.zip` を更新します。ZIPにはexe、設定ファイル、README、LICENSEを含めます。ソースを変更して配布するときは、ZIPもこのコマンドで更新してください。
+ビルドとセルフテストを実行し、成功すると `dist/DriveScope-portable.zip` を更新します。ZIPにはexe、設定ファイル、README、LICENSEとREADME表示用のロゴを含めます。アプリ用のアイコンと画面内ロゴはexeに埋め込んでいるため、外部の画像ファイルがなくても起動できます。ソースを変更して配布するときは、ZIPもこのコマンドで更新してください。
 
 ### 検証
 
@@ -135,6 +140,7 @@ Get-Content (Join-Path $reportDirectory 'ui-test.txt')
 ### 構成
 
 ```text
+assets/branding/           元のSVGロゴ・派生PNG・Windows用ICO
 src/
   App.cs                 画面操作・集計表示
   MainWindow.xaml        WPFの画面定義
@@ -145,8 +151,11 @@ src/
 DriveScope.exe.config    .NET Frameworkの実行設定
 build.ps1                ビルド
 package.ps1              ビルド・テスト・ZIP作成
+tools/render-branding.cjs  SVGからPNG・複数サイズのICOを再生成
 dist/                    配布用ZIP
 ```
+
+アプリアイコンにはダーク版、画面ヘッダーにはLOCAL付きの横長ロゴを使用しています。READMEは表示テーマに応じてダーク背景用・明るい背景用のSVGを切り替えます。元のSVGは `assets/branding` に保存しています。派生画像を再生成する場合のみ、Node.jsと`sharp`を導入した開発環境で `node tools/render-branding.cjs` を実行してください。通常のビルドやアプリの実行には不要です。
 
 変更時は `package.ps1` による検証を行い、UIを変更した場合は画面表示も確認してください。不具合の報告にはWindowsのバージョン、ドライブの種類、再現手順を添えると調査しやすくなります。
 

@@ -69,6 +69,16 @@ namespace DriveScope
         public MainController(bool autoScan, string screenshot, string liveVerification = null, string uiVerification = null)
         {
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MainWindow.xaml")) window = (Window)XamlReader.Load(stream);
+            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Branding.Icon"))
+            {
+                var decoder = new IconBitmapDecoder(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                window.Icon = decoder.Frames.OrderByDescending(frame => frame.PixelWidth).First();
+            }
+            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Branding.Logo"))
+            {
+                var logo = new BitmapImage(); logo.BeginInit(); logo.CacheOption = BitmapCacheOption.OnLoad; logo.StreamSource = stream; logo.EndInit(); logo.Freeze();
+                UI<Image>("BrandLogo").Source = logo;
+            }
             verificationMode = uiVerification != null;
             preferences.Load(preferencesPath); drives = new DriveSet(preferences); states = drives.States;
             UI<Button>("RefreshDrives").Click += async delegate { await DiscoverDrives(); };
