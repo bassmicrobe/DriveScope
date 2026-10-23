@@ -17,7 +17,9 @@ Unity / VRChatのプロジェクト、ゲーム、キャッシュ、AIモデル�
 
 ## ダウンロード・起動
 
-**[DriveScope-portable.zip をダウンロード](https://github.com/bassmicrobe/DriveScope/raw/refs/heads/main/dist/DriveScope-portable.zip)**
+**[DriveScope-portable.zip をダウンロード](https://github.com/bassmicrobe/DriveScope/releases/latest/download/DriveScope-portable.zip)**
+
+最新版は[GitHub Releases](https://github.com/bassmicrobe/DriveScope/releases/latest)から取得できます。リリースページでは変更内容も確認できます。
 
 1. ZIPを任意のフォルダに解凍します。
 2. `DriveScope.exe` を起動します。`DriveScope.exe.config` はexeと同じフォルダに置いてください。
