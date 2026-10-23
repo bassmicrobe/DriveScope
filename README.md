@@ -9,6 +9,12 @@
 
 Unity / VRChatのプロジェクト、ゲーム、キャッシュ、AIモデルなども分類します。インストール不要で、ファイルの削除・移動機能や外部送信機能はありません。
 
+## アプリ画面
+
+![ロゴを適用したDriveScopeのドライブ比較画面](assets/screenshots/drivescope-overview.png)
+
+ロゴ適用後のアプリから撮影した表示例です。容量・ドライブ名はサンプルデータで、実際のPCの情報は含みません。チェックしたドライブをカテゴリごとに横並びで比較できます。
+
 ## ダウンロード・起動
 
 **[DriveScope-portable.zip をダウンロード](https://github.com/bassmicrobe/DriveScope/raw/refs/heads/main/dist/DriveScope-portable.zip)**
@@ -108,7 +114,7 @@ Start-Process .\DriveScope.exe
 .\package.ps1
 ```
 
-ビルドとセルフテストを実行し、成功すると `dist/DriveScope-portable.zip` を更新します。ZIPにはexe、設定ファイル、README、LICENSEとREADME表示用のロゴを含めます。アプリ用のアイコンと画面内ロゴはexeに埋め込んでいるため、外部の画像ファイルがなくても起動できます。ソースを変更して配布するときは、ZIPもこのコマンドで更新してください。
+ビルドとセルフテストを実行し、成功すると `dist/DriveScope-portable.zip` を更新します。ZIPにはexe、設定ファイル、README、LICENSEとREADME表示用のロゴ・画面画像を含めます。アプリ用のアイコンと画面内ロゴはexeに埋め込んでいるため、外部の画像ファイルがなくても起動できます。ソースを変更して配布するときは、ZIPもこのコマンドで更新してください。
 
 ### 検証
 
@@ -137,16 +143,36 @@ Get-Content (Join-Path $reportDirectory 'ui-test.txt')
 
 画面検証のレポートや画像には実際のPCのドライブ情報・ファイルパスが含まれるため、配布ZIPには含めていません。
 
+周期更新の回帰テストは `--verify-refresh` で実行できます。約10秒間、自動更新中に一覧・行の選択・背景ブラシが作り直されないことを確認し、その後に値の更新が既存のセルへ反映されることを検証します。
+
+```powershell
+Start-Process .\DriveScope.exe -ArgumentList @(
+    '--verify-refresh', ('"' + $reportDirectory + '"')
+) -WindowStyle Hidden -Wait
+Get-Content (Join-Path $reportDirectory 'refresh-test.txt')
+```
+
+READMEの画面画像は、アプリを終了した状態で次のコマンドから再生成できます。このモードでは実ドライブや保存済みの集計結果・選択設定を読み込まず、サンプルデータだけを表示します。
+
+```powershell
+Start-Process .\DriveScope.exe -ArgumentList @(
+    '--docs-screenshot', ('"' + (Join-Path $PWD 'assets\screenshots\drivescope-overview.png') + '"')
+) -WindowStyle Hidden -Wait
+```
+
 ### 構成
 
 ```text
 assets/branding/           元のSVGロゴ・派生PNG・Windows用ICO
+assets/screenshots/        README用のアプリ画面（サンプルデータ）
 src/
   App.cs                 画面操作・集計表示
   MainWindow.xaml        WPFの画面定義
   DriveManagement.cs     ドライブ検出・識別・選択保存
   Scanner.cs             ファイル走査・分類・集計・結果保存
   Verification.cs        セルフテストと画面検証
+  ViewRows.cs            行の差分更新・変更通知
+  PresentationVerification.cs  表示更新の回帰テスト・公開用サンプル表示
   app.manifest           実行権限・長いパスへの対応
 DriveScope.exe.config    .NET Frameworkの実行設定
 build.ps1                ビルド

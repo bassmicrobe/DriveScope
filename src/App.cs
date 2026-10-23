@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -9,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Markup;
 using System.Windows.Media;
@@ -18,41 +20,26 @@ using Microsoft.Win32;
 
 namespace DriveScope
 {
-    public sealed class DisplayRow
-    {
-        public string Name { get; set; } public string Path { get; set; } public string Category { get; set; }
-        public long Bytes { get; set; } public double Ratio { get; set; }
-        public string Size { get { return Catalog.Size(Bytes); } }
-        public string Share { get { return Ratio.ToString("P1"); } }
-    }
     sealed class CategoryView
     {
         public ListBoxItem Item; public TextBlock Size, Count; public Border Bar;
-    }
-    public sealed class SizeCell
-    {
-        public long Bytes { get; set; }
-        public string Text { get { return Catalog.Size(Bytes); } }
-    }
-    public sealed class ComparisonRow
-    {
-        public string Name { get; set; }
-        public List<SizeCell> Cells { get; set; }
-        public long Bytes { get { return Cells.Sum(c => c.Bytes); } }
-        public string Total { get { return Catalog.Size(Bytes); } }
     }
     sealed class DriveView
     {
         public Button Button; public CheckBox Choice; public TextBlock Label, Used, Free, Status, Delta; public Border Bar, Track;
     }
-    public sealed class MainController
+    public sealed partial class MainController
     {
         readonly Window window;
         readonly List<ScanState> states;
         readonly DriveSelection preferences = new DriveSelection();
         readonly DriveSet drives;
         readonly string preferencesPath = Path.Combine(Store.DirectoryPath, "selection.txt");
-        bool discovering, verificationMode;
+        bool discovering, verificationMode, inventoryInitialized;
+        readonly ObservableCollection<DisplayRow> folderItems = new ObservableCollection<DisplayRow>();
+        readonly ObservableCollection<DisplayRow> fileItems = new ObservableCollection<DisplayRow>();
+        readonly ObservableCollection<DisplayRow> issueItems = new ObservableCollection<DisplayRow>();
+        readonly ObservableCollection<ComparisonRow> comparisonItems = new ObservableCollection<ComparisonRow>();
         string comparisonSignature = "", inventoryError = "";
         readonly List<Task> workers = new List<Task>();
         readonly Dictionary<ScanState, DriveView> driveViews = new Dictionary<ScanState, DriveView>();
@@ -62,11 +49,18 @@ namespace DriveScope
         int tick; bool dirty = true;
         List<DisplayRow> folderRows = new List<DisplayRow>(), fileRows = new List<DisplayRow>(), issueRows = new List<DisplayRow>();
         public Window Window { get { return window; } }
+        public bool VerificationFailed { get; private set; }
         T UI<T>(string name) where T : FrameworkElement { return (T)window.FindName(name); }
-        static SolidColorBrush Brush(string value) { return (SolidColorBrush)new BrushConverter().ConvertFromString(value); }
+        static readonly Dictionary<string, SolidColorBrush> brushes = new Dictionary<string, SolidColorBrush>();
+        static SolidColorBrush Brush(string value)
+        {
+            SolidColorBrush brush;
+            if (!brushes.TryGetValue(value, out brush)) { brush = (SolidColorBrush)new BrushConverter().ConvertFromString(value); brush.Freeze(); brushes[value] = brush; }
+            return brush;
+        }
         static TextBlock Text(string text, double size, string color) { return new TextBlock { Text = text, FontSize = size, Foreground = Brush(color) }; }
 
-        public MainController(bool autoScan, string screenshot, string liveVerification = null, string uiVerification = null)
+        public MainController(bool autoScan, string screenshot, string liveVerification = null, string uiVerification = null, string refreshVerification = null, bool documentation = false)
         {
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MainWindow.xaml")) window = (Window)XamlReader.Load(stream);
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Branding.Icon"))
@@ -79,9 +73,18 @@ namespace DriveScope
                 var logo = new BitmapImage(); logo.BeginInit(); logo.CacheOption = BitmapCacheOption.OnLoad; logo.StreamSource = stream; logo.EndInit(); logo.Freeze();
                 UI<Image>("BrandLogo").Source = logo;
             }
-            verificationMode = uiVerification != null;
-            preferences.Load(preferencesPath); drives = new DriveSet(preferences); states = drives.States;
-            UI<Button>("RefreshDrives").Click += async delegate { await DiscoverDrives(); };
+            UI<DataGrid>("Folders").ItemsSource = folderItems;
+            UI<DataGrid>("Files").ItemsSource = fileItems;
+            UI<DataGrid>("Issues").ItemsSource = issueItems;
+            UI<DataGrid>("Comparison").ItemsSource = comparisonItems;
+            foreach (var source in new object[] { folderItems, fileItems, issueItems, comparisonItems })
+            {
+                var live = CollectionViewSource.GetDefaultView(source) as ICollectionViewLiveShaping;
+                if (live != null && live.CanChangeLiveSorting) live.IsLiveSorting = true;
+            }
+            verificationMode = uiVerification != null || documentation;
+            if (!documentation) preferences.Load(preferencesPath); drives = new DriveSet(preferences); states = drives.States;
+            UI<Button>("RefreshDrives").Click += async delegate { await DiscoverDrives(true); };
             AddCategory(-1); for (int i = 0; i < Catalog.Names.Length; i++) AddCategory(i);
             UI<ListBox>("Categories").SelectedIndex = 0;
             UI<ListBox>("Categories").SelectionChanged += delegate {
@@ -124,18 +127,26 @@ namespace DriveScope
             }; timer.Start();
             Refresh();
             window.ContentRendered += async delegate {
-                await DiscoverDrives();
+                if (documentation) { LoadDocumentationSample(); timer.Stop(); }
+                else await DiscoverDrives();
                 loading = false; dirty = true; Refresh();
                 if (autoScan) Start(drives.Targets);
+                if (!String.IsNullOrEmpty(refreshVerification))
+                {
+                    try { await VerifyIdleRefresh(refreshVerification); }
+                    catch (Exception ex) { VerificationFailed = true; File.AppendAllText(Path.Combine(refreshVerification, "refresh-test.txt"), "\nFAIL: " + ex); }
+                    window.Close(); return;
+                }
                 if (!String.IsNullOrEmpty(uiVerification))
                 {
                     try { VerifyUi(uiVerification); }
-                    catch (Exception ex) { File.WriteAllText(Path.Combine(uiVerification, "ui-test.txt"), "FAIL: " + ex); }
+                    catch (Exception ex) { VerificationFailed = true; File.WriteAllText(Path.Combine(uiVerification, "ui-test.txt"), "FAIL: " + ex); }
                     window.Close(); return;
                 }
                 if (!String.IsNullOrEmpty(screenshot))
                 {
                     await Task.Delay(500); window.UpdateLayout();
+                    if (documentation) UI<TextBlock>("ScanStatus").Text = "表示例：サンプルデータ（実際のPCの情報ではありません）";
                     Capture(screenshot);
                     window.Close();
                 }
@@ -204,8 +215,10 @@ namespace DriveScope
         void Capture(string path)
         {
             window.UpdateLayout();
-            var bitmap = new RenderTargetBitmap((int)window.ActualWidth, (int)window.ActualHeight, 96, 96, PixelFormats.Pbgra32);
-            bitmap.Render(window); var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
+            var client = VisualTreeHelper.GetChildrenCount(window) > 0 ? VisualTreeHelper.GetChild(window, 0) as FrameworkElement : null;
+            if (client == null) client = window;
+            var bitmap = new RenderTargetBitmap((int)Math.Ceiling(client.ActualWidth), (int)Math.Ceiling(client.ActualHeight), 96, 96, PixelFormats.Pbgra32);
+            bitmap.Render(client); var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
             using (var output = File.Create(path)) encoder.Save(output);
         }
         void WriteDiagnostics(string directory)
@@ -220,22 +233,25 @@ namespace DriveScope
             File.WriteAllLines(Path.Combine(directory, "live-scan.txt"), lines);
         }
         async void PollDrives() { await DiscoverDrives(); }
-        async Task DiscoverDrives()
+        async Task DiscoverDrives(bool manual = false)
         {
             if (discovering || closing || verificationMode && !loading) return;
-            discovering = true; UI<Button>("RefreshDrives").IsEnabled = false;
+            discovering = true; if (manual) UI<Button>("RefreshDrives").IsEnabled = false;
             try
             {
                 var inventory = await Task.Run(() => DriveInventory.Read());
                 if (closing) return;
                 var added = ApplyInventory(inventory);
                 foreach (var s in added.Where(s => s.Ready)) s.LoadingCache = true;
-                inventoryError = ""; dirty = true; Refresh();
-                await Task.WhenAll(added.Where(s => s.Ready).Select(s => LoadCache(s)).ToArray());
-                dirty = true; Refresh();
+                inventoryError = ""; Refresh();
+                if (added.Any(s => s.Ready))
+                {
+                    await Task.WhenAll(added.Where(s => s.Ready).Select(s => LoadCache(s)).ToArray());
+                    dirty = true; Refresh();
+                }
             }
             catch (Exception ex) { inventoryError = "ドライブ一覧を更新できません: " + ex.Message; }
-            finally { discovering = false; if (!closing) UI<Button>("RefreshDrives").IsEnabled = true; }
+            finally { discovering = false; if (manual && !closing) UI<Button>("RefreshDrives").IsEnabled = true; }
         }
         async Task LoadCache(ScanState state)
         {
@@ -244,10 +260,19 @@ namespace DriveScope
         }
         List<ScanState> ApplyInventory(IEnumerable<DriveDescriptor> inventory)
         {
-            var before = states.Where(s => s.Present).ToArray(); var added = drives.Apply(inventory);
-            if (driveViews.Count == 0 || !before.SequenceEqual(states.Where(s => s.Present))) RebuildDriveCards();
-            if (selected != null && (!selected.Present || !selected.Ready)) { selected = null; folder = ""; }
-            dirty = true; return added;
+            var before = states.Where(s => s.Present).ToArray();
+            string beforeTargets = InventoryPresentationKey();
+            var added = drives.Apply(inventory);
+            bool structureChanged = !inventoryInitialized || !before.SequenceEqual(states.Where(s => s.Present));
+            if (structureChanged) RebuildDriveCards();
+            inventoryInitialized = true;
+            if (selected != null && (!selected.Present || !selected.Ready)) { selected = null; folder = ""; dirty = true; }
+            if (structureChanged || beforeTargets != InventoryPresentationKey()) dirty = true;
+            return added;
+        }
+        string InventoryPresentationKey()
+        {
+            return String.Join("|", states.Where(s => s.Present).Select(s => s.Root + s.VolumeIdentity + s.Ready + s.Included));
         }
         void SetIncluded(ScanState state, bool included)
         {
@@ -285,6 +310,7 @@ namespace DriveScope
             view.Used = Text("—", 25, "#E9EDF5"); view.Used.Margin = new Thickness(0, 12, 0, 7); Grid.SetRow(view.Used, 1); grid.Children.Add(view.Used);
             view.Track = new Border { Height = 6, Background = Brush("#31394B"), CornerRadius = new CornerRadius(3) };
             view.Bar = new Border { Height = 6, Background = Brush("#8DE1C9"), CornerRadius = new CornerRadius(3), HorizontalAlignment = HorizontalAlignment.Left, Width = 0 }; view.Track.Child = view.Bar;
+            view.Track.SizeChanged += delegate { view.Bar.Width = state.Ready && state.Capacity > 0 ? Math.Max(0, view.Track.ActualWidth * Math.Min(1, (double)(state.Capacity - state.Free) / state.Capacity)) : 0; };
             Grid.SetRow(view.Track, 2); grid.Children.Add(view.Track);
             view.Free = Text("", 11, "#A3AEC2"); view.Free.Margin = new Thickness(0, 8, 0, 0); Grid.SetRow(view.Free, 3); grid.Children.Add(view.Free);
             view.Delta = Text("", 10, "#8795AD"); view.Delta.Margin = new Thickness(0, 4, 0, 0); Grid.SetRow(view.Delta, 4); grid.Children.Add(view.Delta);
@@ -388,12 +414,11 @@ namespace DriveScope
             if (comparing) UI<TextBlock>("DetailSummary").Text = drives.Targets.Count() + "ドライブを比較 · チェックを外すと集計から除外";
             if (dirty || (running > 0 && tick % 4 == 0)) RefreshDetails();
         }
-        void SetRows(DataGrid grid, List<DisplayRow> rows)
+        List<DisplayRow> SetRows(DataGrid grid, List<DisplayRow> rows)
         {
-            var prior = grid.SelectedItem as DisplayRow; string path = prior == null ? null : prior.Path;
-            var sort = grid.Items.SortDescriptions.ToArray(); grid.ItemsSource = rows;
-            foreach (var s in sort) grid.Items.SortDescriptions.Add(s);
-            if (path != null) grid.SelectedItem = rows.FirstOrDefault(r => r.Path == path);
+            var items = (ObservableCollection<DisplayRow>)grid.ItemsSource;
+            RowReconciler.Update(items, rows, row => String.IsNullOrEmpty(row.Path) ? row.Name : row.Path, (current, next) => current.UpdateFrom(next));
+            return items.ToList();
         }
         void EnsureComparisonColumns(ScanState[] targets)
         {
@@ -416,7 +441,7 @@ namespace DriveScope
                 foreach (var state in targets) lock (state.Gate) row.Cells.Add(new SizeCell { Bytes = state.Bytes[i] });
                 comparisons.Add(row);
             }
-            var comparisonGrid = UI<DataGrid>("Comparison"); var comparisonSort = comparisonGrid.Items.SortDescriptions.ToArray(); comparisonGrid.ItemsSource = comparisons.OrderByDescending(r => r.Bytes).ToList(); foreach (var sorting in comparisonSort) comparisonGrid.Items.SortDescriptions.Add(sorting);
+            RowReconciler.Update(comparisonItems, comparisons.OrderByDescending(row => row.Bytes), row => row.Name, (current, next) => current.UpdateFrom(next));
             folderRows.Clear(); fileRows.Clear(); issueRows.Clear(); long parentBytes = 0;
             foreach (var s in ActiveStates())
             {
@@ -446,7 +471,7 @@ namespace DriveScope
             folderRows = folderRows.Where(filter).OrderByDescending(r => r.Bytes).ThenBy(r => r.Path).ToList();
             fileRows = fileRows.Where(filter).OrderByDescending(r => r.Bytes).ThenBy(r => r.Path).Take(300).ToList();
             issueRows = issueRows.Where(filter).ToList();
-            SetRows(UI<DataGrid>("Folders"), folderRows); SetRows(UI<DataGrid>("Files"), fileRows); SetRows(UI<DataGrid>("Issues"), issueRows);
+            folderRows = SetRows(UI<DataGrid>("Folders"), folderRows); fileRows = SetRows(UI<DataGrid>("Files"), fileRows); issueRows = SetRows(UI<DataGrid>("Issues"), issueRows);
             UI<DataGrid>("Folders").ToolTip = "フォルダを選択して「エクスプローラーで表示」／ダブルクリックで中を表示";
             UI<DataGrid>("Files").ToolTip = "ドライブごと・カテゴリごとの上位100ファイルから表示。ダブルクリックで場所を表示。";
             UI<TextBlock>("FolderPath").Text = folder.Length > 0 ? folder : selected == null ? "全ドライブのルート" : selected.Root;
@@ -508,7 +533,8 @@ namespace DriveScope
             if (args.Length > 1 && args[0] == "--scan-root") return Verification.ScanRoot(args);
             if (args.Length > 1 && args[0] == "--verify-caches") return Verification.VerifyCaches(args[1]);
             if (args.Length > 1 && args[0] == "--migrate-legacy") return Verification.MigrateLegacy(args[1]);
-            string screenshot = args.Length > 1 && args[0] == "--screenshot" ? args[1] : null;
+            bool documentation = args.Length > 1 && args[0] == "--docs-screenshot";
+            string screenshot = args.Length > 1 && (args[0] == "--screenshot" || documentation) ? args[1] : null;
             using (var mutex = new Mutex(false, "Local\\DriveScope.CapacityViewer"))
             {
                 bool acquired = false; try { acquired = mutex.WaitOne(0); } catch (AbandonedMutexException) { acquired = true; }
@@ -519,7 +545,9 @@ namespace DriveScope
                     app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e) { MessageBox.Show(e.Exception.Message, "DriveScope"); e.Handled = true; };
                     string live = args.Length > 1 && args[0] == "--verify-live" ? args[1] : null;
                     string uiVerify = args.Length > 1 && args[0] == "--verify-ui" ? args[1] : null;
-                    var controller = new MainController(args.Contains("--scan") || live != null, screenshot, live, uiVerify); app.Run(controller.Window);
+                    string refreshVerify = args.Length > 1 && args[0] == "--verify-refresh" ? args[1] : null;
+                    var controller = new MainController(args.Contains("--scan") || live != null, screenshot, live, uiVerify, refreshVerify, documentation); app.Run(controller.Window);
+                    if (controller.VerificationFailed) return 1;
                 }
                 catch (Exception ex)
                 {

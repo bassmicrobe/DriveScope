@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -65,6 +67,7 @@ namespace DriveScope
                 byte[] csvBytes = File.ReadAllBytes(csv); string csvText = File.ReadAllText(csv);
                 Assert(csvBytes[0] == 239 && csvBytes[1] == 187 && csvBytes[2] == 191 && csvText.Contains("\"a,\"\"b\"\"\"") && csvText.Contains("改行\nあり"), "Excel UTF-8 BOM and CSV escaping", log);
                 VerifyDriveManagement(output, log);
+                VerifyIncrementalRows(log);
                 log.Add("ALL CHECKS PASSED"); File.WriteAllLines(Path.Combine(output, "self-test.txt"), log); return 0;
             }
             catch (Exception ex) { log.Add(ex.ToString()); File.WriteAllLines(Path.Combine(output, "self-test.txt"), log); return 1; }
@@ -74,6 +77,31 @@ namespace DriveScope
                 if (Path.GetFullPath(root).StartsWith(output.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)) Directory.Delete(root, true);
             }
         }
+        static void VerifyIncrementalRows(List<string> log)
+        {
+            var rows = new ObservableCollection<DisplayRow>(); var actions = new List<NotifyCollectionChangedAction>();
+            rows.CollectionChanged += delegate(object sender, NotifyCollectionChangedEventArgs e) { actions.Add(e.Action); };
+            Func<DisplayRow, string> key = row => row.Path; Func<DisplayRow, DisplayRow, bool> update = (current, next) => current.UpdateFrom(next);
+            RowReconciler.Update(rows, new[] { new DisplayRow { Name = "A", Path = "A", Bytes = 10 }, new DisplayRow { Name = "B", Path = "B", Bytes = 20 } }, key, update);
+            var a = rows[0]; var b = rows[1]; actions.Clear();
+            bool changed = RowReconciler.Update(rows, new[] { new DisplayRow { Name = "A", Path = "A", Bytes = 10 }, new DisplayRow { Name = "B", Path = "B", Bytes = 20 } }, key, update);
+            Assert(!changed && actions.Count == 0 && rows[0] == a && rows[1] == b, "unchanged presentation keeps row identity without collection notifications", log);
+            int sizeNotifications = 0; a.PropertyChanged += delegate(object sender, System.ComponentModel.PropertyChangedEventArgs e) { if (e.PropertyName == "Size") sizeNotifications++; };
+            RowReconciler.Update(rows, new[] { new DisplayRow { Name = "A", Path = "A", Bytes = 30 }, new DisplayRow { Name = "B", Path = "B", Bytes = 20 } }, key, update);
+            Assert(rows[0] == a && a.Bytes == 30 && sizeNotifications == 1 && actions.Count == 0, "size update notifies existing row without replacing the collection", log);
+            RowReconciler.Update(rows, new[] { new DisplayRow { Name = "B", Path = "B", Bytes = 20 }, new DisplayRow { Name = "A", Path = "A", Bytes = 30 } }, key, update);
+            Assert(rows[0] == b && rows[1] == a && actions.SequenceEqual(new[] { NotifyCollectionChangedAction.Move }), "rank changes move existing rows without resetting", log);
+            actions.Clear(); RowReconciler.Update(rows, new[] { new DisplayRow { Name = "C", Path = "C", Bytes = 40 }, new DisplayRow { Name = "A", Path = "A", Bytes = 30 } }, key, update);
+            Assert(rows.Count == 2 && rows[1] == a && !actions.Contains(NotifyCollectionChangedAction.Reset), "file additions and removals preserve unaffected rows", log);
+            var comparison = new ComparisonRow { Name = "test", Cells = new List<SizeCell> { new SizeCell { Bytes = 10 }, new SizeCell { Bytes = 20 } } };
+            var cells = comparison.Cells; var cell = cells[1]; int textNotifications = 0;
+            cell.PropertyChanged += delegate(object sender, System.ComponentModel.PropertyChangedEventArgs e) { if (e.PropertyName == "Text") textNotifications++; };
+            comparison.UpdateFrom(new ComparisonRow { Name = "test", Cells = new List<SizeCell> { new SizeCell { Bytes = 10 }, new SizeCell { Bytes = 40 } } });
+            Assert(comparison.Cells == cells && comparison.Cells[1] == cell && comparison.Bytes == 50 && textNotifications == 1, "drive comparison updates existing cells and total", log);
+            changed = comparison.UpdateFrom(new ComparisonRow { Name = "test", Cells = new List<SizeCell> { new SizeCell { Bytes = 10 }, new SizeCell { Bytes = 40 } } });
+            Assert(!changed && textNotifications == 1, "unchanged drive cells do not raise redundant changes", log);
+        }
+
         public static int VerifyCaches(string output)
         {
             var log = new List<string>(); bool ok = true;
