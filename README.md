@@ -1,3 +1,5 @@
+![DriveScope — ドライブ容量を、ひと目で。カテゴリ別に可視化・比較](assets/social/drivescope-ogp.jpg)
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/branding/drivescope-logo-local.svg">
   <img src="assets/branding/drivescope-logo-on-light-local.svg" alt="DriveScope LOCAL" width="361" height="64">

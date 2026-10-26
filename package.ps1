@@ -26,7 +26,8 @@ try {
         'LICENSE',
         'assets/branding/drivescope-logo-local.svg',
         'assets/branding/drivescope-logo-on-light-local.svg',
-        'assets/screenshots/drivescope-overview.png'
+        'assets/screenshots/drivescope-overview.png',
+        'assets/social/drivescope-ogp.jpg'
     )) {
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $appRoot $entryName), $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
     }
