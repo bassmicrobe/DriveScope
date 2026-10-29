@@ -65,24 +65,42 @@ namespace DriveScope
     }
     public sealed class DriveSelection
     {
+        const int MaxPreferenceBytes = 4096;
         public readonly Dictionary<string, bool> Choices = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         public bool Get(DriveDescriptor drive) { bool chosen; return Choices.TryGetValue(drive.Root, out chosen) ? chosen : drive.DefaultIncluded; }
         public void Save(string path)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)));
-            string temp = path + ".tmp";
-            File.WriteAllLines(temp, Choices.OrderBy(p => p.Key).Select(p => p.Key + "\t" + (p.Value ? "1" : "0")), new UTF8Encoding(false));
-            if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
+            path = Path.GetFullPath(path); Directory.CreateDirectory(Path.GetDirectoryName(path));
+            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(file, new UTF8Encoding(false)))
+                    foreach (var choice in Choices.OrderBy(p => p.Key)) writer.WriteLine(choice.Key + "\t" + (choice.Value ? "1" : "0"));
+                if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
+            }
+            finally { if (File.Exists(temp)) File.Delete(temp); }
         }
         public void Load(string path)
         {
             if (!File.Exists(path)) return;
             try
             {
-                foreach (string line in File.ReadAllLines(path))
+                using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
-                    string[] parts = line.Split('\t');
-                    if (parts.Length == 2 && parts[0].Length == 3 && Char.IsLetter(parts[0][0]) && parts[0].Substring(1) == ":\\" && (parts[1] == "0" || parts[1] == "1")) Choices[parts[0]] = parts[1] == "1";
+                    // Only 26 drive-letter choices are possible. Inspect the opened
+                    // handle before decoding so a corrupt long line cannot allocate
+                    // an arbitrarily large string; ignored files use drive defaults.
+                    if (file.Length > MaxPreferenceBytes) return;
+                    using (var reader = new StreamReader(file, Encoding.UTF8, true))
+                    {
+                        string line;
+                        while ((line = reader.ReadLine()) != null)
+                        {
+                            string[] parts = line.Split('\t');
+                            if (parts.Length == 2 && parts[0].Length == 3 && ((parts[0][0] >= 'A' && parts[0][0] <= 'Z') || (parts[0][0] >= 'a' && parts[0][0] <= 'z')) && parts[0].Substring(1) == ":\\" && (parts[1] == "0" || parts[1] == "1")) Choices[parts[0]] = parts[1] == "1";
+                        }
+                    }
                 }
             }
             catch (IOException) { }

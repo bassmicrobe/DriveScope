@@ -50,6 +50,16 @@ Get-Content (Join-Path $reportDirectory 'ui-test.txt')
 
 画面検証のレポートや画像には実際のPCのドライブ情報・ファイルパスが含まれるため、配布ZIPには含めていません。
 
+実ドライブや保存済みの設定を使わず、サンプルデータでキーボード操作、絞り込み、小さいウィンドウ、定期更新時の表示維持を確認するには、次のコマンドを使用します。
+
+```powershell
+Start-Process .\DriveScope.exe -ArgumentList @(
+    '--verify-presentation', ('"' + $reportDirectory + '"')
+) -WindowStyle Hidden -Wait
+Get-Content (Join-Path $reportDirectory 'presentation-test.txt')
+Get-Content (Join-Path $reportDirectory 'idle\refresh-test.txt')
+```
+
 周期更新の回帰テストは `--verify-refresh` で実行できます。約10秒間、自動更新中に一覧・行の選択・背景ブラシが作り直されないことを確認し、その後に値の更新が既存のセルへ反映されることを検証します。
 
 ```powershell

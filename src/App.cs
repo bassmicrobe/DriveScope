@@ -9,6 +9,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
@@ -22,7 +23,7 @@ namespace DriveScope
 {
     sealed class CategoryView
     {
-        public ListBoxItem Item; public TextBlock Size, Count; public Border Bar;
+        public ListBoxItem Item; public TextBlock Size, Count; public Border Bar, Track;
     }
     sealed class DriveView
     {
@@ -40,11 +41,13 @@ namespace DriveScope
         readonly ObservableCollection<DisplayRow> fileItems = new ObservableCollection<DisplayRow>();
         readonly ObservableCollection<DisplayRow> issueItems = new ObservableCollection<DisplayRow>();
         readonly ObservableCollection<ComparisonRow> comparisonItems = new ObservableCollection<ComparisonRow>();
-        string comparisonSignature = "", inventoryError = "";
+        string comparisonSignature = "", inventoryError = "", preferencesError = "", feedbackMessage = "";
+        DateTime feedbackUntil;
         readonly List<Task> workers = new List<Task>();
         readonly Dictionary<ScanState, DriveView> driveViews = new Dictionary<ScanState, DriveView>();
         readonly Dictionary<int, CategoryView> categoryViews = new Dictionary<int, CategoryView>();
         readonly DispatcherTimer timer = new DispatcherTimer();
+        readonly DispatcherTimer searchTimer = new DispatcherTimer();
         ScanState selected; int category = -1; string folder = ""; bool loading = true, closing;
         int tick; bool dirty = true;
         List<DisplayRow> folderRows = new List<DisplayRow>(), fileRows = new List<DisplayRow>(), issueRows = new List<DisplayRow>();
@@ -60,9 +63,15 @@ namespace DriveScope
         }
         static TextBlock Text(string text, double size, string color) { return new TextBlock { Text = text, FontSize = size, Foreground = Brush(color) }; }
 
-        public MainController(bool autoScan, string screenshot, string liveVerification = null, string uiVerification = null, string refreshVerification = null, bool documentation = false)
+        public MainController(bool autoScan, string screenshot, string liveVerification = null, string uiVerification = null, string refreshVerification = null, bool documentation = false, string presentationVerification = null)
         {
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MainWindow.xaml")) window = (Window)XamlReader.Load(stream);
+            FitWindowToWorkArea();
+            UI<ScrollViewer>("MainScroll").SizeChanged += delegate {
+                // Keep the grid's measure finite so nested DataGrids retain row
+                // virtualization, while short desktops can scroll the full layout.
+                UI<Grid>("ContentGrid").Height = Math.Max(780, UI<ScrollViewer>("MainScroll").ActualHeight - 44);
+            };
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Branding.Icon"))
             {
                 var decoder = new IconBitmapDecoder(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
@@ -77,13 +86,20 @@ namespace DriveScope
             UI<DataGrid>("Files").ItemsSource = fileItems;
             UI<DataGrid>("Issues").ItemsSource = issueItems;
             UI<DataGrid>("Comparison").ItemsSource = comparisonItems;
+            AutomationProperties.SetName(UI<ListBox>("Categories"), "使用量のカテゴリ");
+            foreach (var name in new[] { "Folders", "Files", "Issues", "Comparison" })
+            {
+                var grid = UI<DataGrid>(name);
+                AutomationProperties.SetName(grid, name == "Folders" ? "フォルダの使用量" : name == "Files" ? "大きいファイル" : name == "Issues" ? "除外・読取エラー" : "カテゴリ別のドライブ比較");
+                grid.SelectionChanged += delegate { UpdateRevealAvailability(); };
+            }
             foreach (var source in new object[] { folderItems, fileItems, issueItems, comparisonItems })
             {
                 var live = CollectionViewSource.GetDefaultView(source) as ICollectionViewLiveShaping;
                 if (live != null && live.CanChangeLiveSorting) live.IsLiveSorting = true;
             }
-            verificationMode = uiVerification != null || documentation;
-            if (!documentation) preferences.Load(preferencesPath); drives = new DriveSet(preferences); states = drives.States;
+            verificationMode = uiVerification != null || documentation || presentationVerification != null;
+            if (!documentation && presentationVerification == null) preferences.Load(preferencesPath); drives = new DriveSet(preferences); states = drives.States;
             UI<Button>("RefreshDrives").Click += async delegate { await DiscoverDrives(true); };
             AddCategory(-1); for (int i = 0; i < Catalog.Names.Length; i++) AddCategory(i);
             UI<ListBox>("Categories").SelectedIndex = 0;
@@ -99,17 +115,24 @@ namespace DriveScope
             };
             UI<Button>("Scan").Click += delegate { Start(drives.Targets); };
             UI<Button>("ScanSelected").Click += delegate { Start(selected == null ? drives.Targets : new[] { selected }); };
-            UI<Button>("Stop").Click += delegate { foreach (var s in states) if (s.Cancel != null) s.Cancel.Cancel(); };
-            UI<Button>("Up").Click += delegate {
-                if (!String.IsNullOrEmpty(folder)) { folder = selected != null && folder.Equals(selected.Root, StringComparison.OrdinalIgnoreCase) ? "" : Scanner.ParentOf(folder); }
-                dirty = true; Refresh();
+            UI<Button>("Stop").Click += delegate { foreach (var s in states) if (s.Cancel != null) s.Cancel.Cancel(); Refresh(); };
+            UI<Button>("Up").Click += delegate { NavigateUp(); };
+            searchTimer.Interval = TimeSpan.FromMilliseconds(200);
+            searchTimer.Tick += delegate { searchTimer.Stop(); dirty = true; RefreshDetails(); };
+            UI<TextBox>("Search").TextChanged += delegate { searchTimer.Stop(); searchTimer.Start(); };
+            UI<DataGrid>("Folders").MouseDoubleClick += delegate(object sender, MouseButtonEventArgs e) {
+                var row = ItemsControl.ContainerFromElement(UI<DataGrid>("Folders"), e.OriginalSource as DependencyObject) as DataGridRow;
+                if (row != null) { OpenFolder(row.Item as DisplayRow); e.Handled = true; }
             };
-            UI<TextBox>("Search").TextChanged += delegate { dirty = true; RefreshDetails(); };
-            UI<DataGrid>("Folders").MouseDoubleClick += delegate {
-                var row = UI<DataGrid>("Folders").SelectedItem as DisplayRow; if (row == null) return;
-                folder = row.Path; dirty = true; Refresh();
+            UI<DataGrid>("Folders").PreviewKeyDown += delegate(object sender, KeyEventArgs e) {
+                if (e.Key == Key.Enter && Keyboard.Modifiers == ModifierKeys.None) { OpenFolder(UI<DataGrid>("Folders").SelectedItem as DisplayRow); e.Handled = true; }
             };
-            UI<DataGrid>("Files").MouseDoubleClick += delegate { Reveal(); };
+            UI<DataGrid>("Files").MouseDoubleClick += delegate(object sender, MouseButtonEventArgs e) {
+                if (ItemsControl.ContainerFromElement(UI<DataGrid>("Files"), e.OriginalSource as DependencyObject) is DataGridRow) { Reveal(); e.Handled = true; }
+            };
+            window.PreviewKeyDown += delegate(object sender, KeyEventArgs e) {
+                if ((e.Key == Key.Up || e.SystemKey == Key.Up) && (Keyboard.Modifiers & ModifierKeys.Alt) != 0 && folder.Length > 0) { NavigateUp(); e.Handled = true; }
+            };
             UI<Button>("Reveal").Click += delegate { Reveal(); };
             UI<Button>("Export").Click += delegate { Export(); };
             window.Closing += OnClosing;
@@ -127,9 +150,15 @@ namespace DriveScope
             }; timer.Start();
             Refresh();
             window.ContentRendered += async delegate {
-                if (documentation) { LoadDocumentationSample(); timer.Stop(); }
+                if (documentation || presentationVerification != null) { LoadDocumentationSample(); timer.Stop(); }
                 else await DiscoverDrives();
                 loading = false; dirty = true; Refresh();
+                if (presentationVerification != null)
+                {
+                    try { await VerifyPresentation(presentationVerification); }
+                    catch (Exception ex) { VerificationFailed = true; File.AppendAllText(Path.Combine(presentationVerification, "presentation-test.txt"), "\nFAIL: " + ex); }
+                    window.Close(); return;
+                }
                 if (autoScan) Start(drives.Targets);
                 if (!String.IsNullOrEmpty(refreshVerification))
                 {
@@ -152,6 +181,32 @@ namespace DriveScope
                 }
             };
         }
+        void FitWindowToWorkArea()
+        {
+            var area = SystemParameters.WorkArea;
+            window.MinWidth = Math.Min(window.MinWidth, area.Width); window.MinHeight = Math.Min(window.MinHeight, area.Height);
+            window.Width = Math.Min(window.Width, area.Width); window.Height = Math.Min(window.Height, area.Height);
+        }
+        void OpenFolder(DisplayRow row)
+        {
+            if (row == null || String.IsNullOrEmpty(row.Path)) return;
+            folder = row.Path; dirty = true; Refresh();
+        }
+        void NavigateUp()
+        {
+            if (!String.IsNullOrEmpty(folder)) folder = selected != null && folder.Equals(selected.Root, StringComparison.OrdinalIgnoreCase) ? "" : Scanner.ParentOf(folder);
+            dirty = true; Refresh();
+        }
+        void SetSearch(string query)
+        {
+            UI<TextBox>("Search").Text = query; searchTimer.Stop(); dirty = true; RefreshDetails();
+        }
+        void UpdateRevealAvailability()
+        {
+            int tab = UI<TabControl>("Tabs").SelectedIndex;
+            var row = tab == 0 ? UI<DataGrid>("Folders").SelectedItem as DisplayRow : tab == 1 ? UI<DataGrid>("Files").SelectedItem as DisplayRow : null;
+            UI<Button>("Reveal").IsEnabled = (tab == 0 || tab == 1) && (row != null && !String.IsNullOrEmpty(row.Path) || folder.Length > 0);
+        }
         void VerifyUi(string directory)
         {
             Directory.CreateDirectory(directory); var log = new List<string>();
@@ -165,16 +220,19 @@ namespace DriveScope
             check(category == cat && UI<TextBlock>("DetailSize").Text == Catalog.Size(target.Bytes[cat]), "category selection updates correct drive total");
             UI<ListBox>("Categories").SelectedIndex = 0;
             var grid = UI<DataGrid>("Folders"); var chosen = folderRows.First(); grid.SelectedItem = chosen;
-            grid.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = Control.MouseDoubleClickEvent });
-            check(folder == chosen.Path, "folder double click navigates to selected folder");
+            grid.ScrollIntoView(chosen); window.UpdateLayout();
+            var chosenContainer = grid.ItemContainerGenerator.ContainerFromItem(chosen) as DataGridRow;
+            check(chosenContainer != null, "selected folder has a visible row");
+            grid.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = Control.MouseDoubleClickEvent, Source = chosenContainer });
+            check(folder == chosen.Path, "folder row double click navigates to selected folder");
             UI<Button>("Up").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             check(String.Equals(folder, target.Root, StringComparison.OrdinalIgnoreCase), "up button returns to parent");
             UI<Button>("Up").RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); check(folder == "", "up button returns to drive root");
-            string query = folderRows.First().Name; UI<TextBox>("Search").Text = query;
+            string query = folderRows.First().Name; SetSearch(query);
             check(folderRows.Count > 0 && folderRows.All(r => r.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 || r.Path.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0), "search filters folder names and paths");
-            UI<TextBox>("Search").Text = "__drivescope_no_matching_path_84e395__";
+            SetSearch("__drivescope_no_matching_path_84e395__");
             check(folderRows.Count == 0 && fileRows.Count == 0, "empty search result works");
-            UI<TextBox>("Search").Text = ""; check(folderRows.Count > 0 && fileRows.Count > 0, "clearing search restores data");
+            SetSearch(""); check(folderRows.Count > 0 && fileRows.Count > 0, "clearing search restores data");
             UI<TabControl>("Tabs").SelectedIndex = 1;
             check(UI<DataGrid>("Files").Items.Count == fileRows.Count && fileRows.Count <= 300, "large-file tab contains bounded ranked files");
             grid.Items.SortDescriptions.Add(new SortDescription("Bytes", ListSortDirection.Ascending));
@@ -253,9 +311,23 @@ namespace DriveScope
             catch (Exception ex) { inventoryError = "ドライブ一覧を更新できません: " + ex.Message; }
             finally { discovering = false; if (manual && !closing) UI<Button>("RefreshDrives").IsEnabled = true; }
         }
-        async Task LoadCache(ScanState state)
+        async Task LoadCache(ScanState state, string overridePath = null)
         {
-            try { await Task.Run(delegate { Store.Load(state); }); }
+            try
+            {
+                await Task.Run(delegate {
+                    string path = overridePath ?? Store.FileName(state);
+                    bool existed = path != null && File.Exists(path);
+                    if (!Store.Load(state, path) && existed)
+                    {
+                        lock (state.Gate)
+                        {
+                            state.Status = "保存結果が無効・再スキャンしてください";
+                            if (state.Issues.Count < 1000) state.Issues.Add("保存結果を読み込めませんでした。対象ドライブを再スキャンしてください。");
+                        }
+                    }
+                });
+            }
             finally { state.LoadingCache = false; }
         }
         List<ScanState> ApplyInventory(IEnumerable<DriveDescriptor> inventory)
@@ -284,8 +356,8 @@ namespace DriveScope
                 if (selected == state) { selected = null; folder = ""; }
             }
             if (!verificationMode)
-                try { preferences.Save(preferencesPath); }
-                catch (Exception ex) { inventoryError = "選択を保存できません: " + ex.Message; }
+                try { preferences.Save(preferencesPath); preferencesError = ""; }
+                catch (Exception ex) { preferencesError = "選択を保存できません: " + ex.Message; }
             dirty = true; Refresh();
         }
         void RebuildDriveCards()
@@ -303,10 +375,11 @@ namespace DriveScope
             view.Label = Text(state.Label, 16, "#E9EDF5"); view.Label.FontWeight = FontWeights.SemiBold; view.Label.TextTrimming = TextTrimming.CharacterEllipsis; title.Children.Add(view.Label);
             var right = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             view.Choice = new CheckBox { Content = "対象", IsChecked = state.Included, Foreground = Brush("#8DE1C9"), Margin = new Thickness(8, 0, 8, 0), VerticalContentAlignment = VerticalAlignment.Center, ToolTip = "スキャンと比較の対象に含める" };
+            AutomationProperties.SetName(view.Choice, state.Label + " をスキャンと比較の対象に含める");
             view.Choice.Checked += delegate { SetIncluded(state, true); }; view.Choice.Unchecked += delegate { SetIncluded(state, false); };
             view.Choice.Click += delegate(object sender, RoutedEventArgs e) { e.Handled = true; };
             right.Children.Add(view.Choice);
-            view.Status = Text("", 10, "#A3AEC2"); right.Children.Add(view.Status); Grid.SetColumn(right, 1); title.Children.Add(right); grid.Children.Add(title);
+            view.Status = Text("", 10, "#A3AEC2"); view.Status.MaxWidth = 110; view.Status.TextTrimming = TextTrimming.CharacterEllipsis; right.Children.Add(view.Status); Grid.SetColumn(right, 1); title.Children.Add(right); grid.Children.Add(title);
             view.Used = Text("—", 25, "#E9EDF5"); view.Used.Margin = new Thickness(0, 12, 0, 7); Grid.SetRow(view.Used, 1); grid.Children.Add(view.Used);
             view.Track = new Border { Height = 6, Background = Brush("#31394B"), CornerRadius = new CornerRadius(3) };
             view.Bar = new Border { Height = 6, Background = Brush("#8DE1C9"), CornerRadius = new CornerRadius(3), HorizontalAlignment = HorizontalAlignment.Left, Width = 0 }; view.Track.Child = view.Bar;
@@ -315,6 +388,7 @@ namespace DriveScope
             view.Free = Text("", 11, "#A3AEC2"); view.Free.Margin = new Thickness(0, 8, 0, 0); Grid.SetRow(view.Free, 3); grid.Children.Add(view.Free);
             view.Delta = Text("", 10, "#8795AD"); view.Delta.Margin = new Thickness(0, 4, 0, 0); Grid.SetRow(view.Delta, 4); grid.Children.Add(view.Delta);
             view.Button = new Button { Content = grid, Width = 392, Margin = new Thickness(5, 0, 5, 0), Padding = new Thickness(18, 15, 18, 13), Background = Brush("#191F2C") };
+            AutomationProperties.SetName(view.Button, state.Label + " の内訳を表示");
             view.Button.Click += delegate { if (!state.Ready) return; selected = state; folder = ""; UI<TabControl>("Tabs").SelectedIndex = 0; dirty = true; Refresh(); };
             driveViews[state] = view; UI<StackPanel>("DriveCards").Children.Add(view.Button);
         }
@@ -322,13 +396,14 @@ namespace DriveScope
         {
             var v = new CategoryView(); var panel = new Grid(); panel.ColumnDefinitions.Add(new ColumnDefinition()); panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             panel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); panel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            var name = Text(id < 0 ? "すべて" : Catalog.Names[id], 12, "#E9EDF5"); panel.Children.Add(name);
+            var name = Text(id < 0 ? "すべて" : Catalog.Names[id], 12, "#E9EDF5"); name.TextTrimming = TextTrimming.CharacterEllipsis; panel.Children.Add(name);
             v.Size = Text("—", 12, id < 0 ? "#8DE1C9" : Catalog.Colors[id]); v.Size.FontWeight = FontWeights.SemiBold; Grid.SetColumn(v.Size, 1); panel.Children.Add(v.Size);
-            var track = new Border { Height = 2, Background = Brush("#2B3343"), Margin = new Thickness(0, 2, 0, 0), CornerRadius = new CornerRadius(2) };
+            var track = new Border { Height = 2, Background = Brush("#2B3343"), Margin = new Thickness(0, 2, 0, 0), CornerRadius = new CornerRadius(2) }; v.Track = track;
             v.Bar = new Border { Width = 0, HorizontalAlignment = HorizontalAlignment.Left, Background = Brush(id < 0 ? "#8DE1C9" : Catalog.Colors[id]), CornerRadius = new CornerRadius(2) }; track.Child = v.Bar;
             Grid.SetRow(track, 1); Grid.SetColumnSpan(track, 2); panel.Children.Add(track);
             v.Count = Text("", 10, "#A3AEC2");
             v.Item = new ListBoxItem { Content = panel, Tag = id }; v.Item.ToolTip = v.Count;
+            AutomationProperties.SetName(v.Item, id < 0 ? "すべてのカテゴリ" : Catalog.Names[id]);
             categoryViews[id] = v; UI<ListBox>("Categories").Items.Add(v.Item);
         }
         void Start(IEnumerable<ScanState> targets)
@@ -368,8 +443,11 @@ namespace DriveScope
                     DriveView v; if (!driveViews.TryGetValue(s, out v)) continue; long used = s.Capacity - s.Free;
                     v.Used.Text = Catalog.Size(used) + " 使用中"; v.Free.Text = "空き " + Catalog.Size(s.Free) + "  /  合計 " + Catalog.Size(s.Capacity);
                     v.Label.Text = s.Label; v.Label.ToolTip = s.Label + " · " + s.Kind;
+                    AutomationProperties.SetName(v.Choice, s.Label + " をスキャンと比較の対象に含める");
+                    AutomationProperties.SetName(v.Button, s.Label + " の内訳を表示");
                     v.Choice.IsEnabled = s.Ready; v.Choice.IsChecked = s.Included;
-                    v.Status.Text = loading || s.LoadingCache ? "読込中" : !s.Ready ? "利用不可" : s.Saving && !s.Running ? "保存中" : s.Status;
+                    v.Status.Text = loading || s.LoadingCache ? "読込中" : !s.Ready ? "利用不可" : s.Saving && !s.Running ? "保存中" : s.Running && s.Cancel != null && s.Cancel.IsCancellationRequested ? "中断中" : s.Status;
+                    v.Status.ToolTip = v.Status.Text;
                     v.Bar.Width = s.Ready && s.Capacity > 0 ? Math.Max(0, v.Track.ActualWidth * Math.Min(1, (double)used / s.Capacity)) : 0;
                     if (!s.Ready || s.Capacity == 0) { v.Used.Text = "未接続"; v.Free.Text = "ドライブを確認してください"; }
                     v.Button.Background = Brush(s == selected ? "#273649" : "#191F2C");
@@ -378,7 +456,7 @@ namespace DriveScope
                         long delta = used - s.Total;
                         string deltaText = delta >= 0 ? "差分 " + Catalog.Size(delta) : "集計が実使用量より " + Catalog.Size(-delta) + " 大きい";
                         v.Delta.Text = "集計 " + Catalog.Size(s.Total) + " · " + (s.Running ? "走査中" : deltaText);
-                        v.Button.ToolTip = "最終集計: " + s.Finished.ToString("yyyy/MM/dd HH:mm") + "\n" + s.CurrentPath;
+                        v.Button.ToolTip = (s.Running ? "スキャン開始: " + s.Started.ToString("yyyy/MM/dd HH:mm") : "最終集計: " + s.Finished.ToString("yyyy/MM/dd HH:mm")) + "\n" + s.CurrentPath;
                     }
                     else v.Delta.Text = "カテゴリを調べるにはスキャンしてください";
                     if (s.Included && s.Ready) { count += s.Files; excluded += s.Skipped + s.Links; }
@@ -388,18 +466,28 @@ namespace DriveScope
             bool canScan = drives.Targets.Any(s => !s.LoadingCache && !s.Running && !s.Saving);
             UI<Button>("Scan").IsEnabled = !loading && canScan;
             UI<Button>("ScanSelected").IsEnabled = !loading && (selected == null ? canScan : selected.Included && selected.Present && selected.Ready && !selected.LoadingCache && !selected.Running && !selected.Saving);
-            UI<Button>("Stop").IsEnabled = running > 0; UI<Button>("Export").IsEnabled = !loading && count > 0;
+            UI<Button>("Stop").IsEnabled = states.Any(s => s.Running && s.Cancel != null && !s.Cancel.IsCancellationRequested); UI<Button>("Export").IsEnabled = !loading && count > 0;
             if (loading) UI<TextBlock>("ScanStatus").Text = "前回の結果を読み込み中…";
-            else if (running > 0) UI<TextBlock>("ScanStatus").Text = String.Format("{0}ドライブをスキャン中  ·  {1:N0}ファイル  ·  除外／エラー {2:N0}件", running, count, excluded);
+            else if (running > 0)
+            {
+                string phase = states.Any(s => s.Running && s.Cancel != null && s.Cancel.IsCancellationRequested) ? "中断中" : states.Any(s => s.Running) ? "スキャン中" : "保存中";
+                UI<TextBlock>("ScanStatus").Text = String.Format("{0}ドライブを{1}  ·  {2:N0}ファイル  ·  除外／エラー {3:N0}件", running, phase, count, excluded);
+            }
             else UI<TextBlock>("ScanStatus").Text = count == 0 ? "対象にチェックを付けてスキャンしてください。" : String.Format("{0:N0}ファイルを集計  ·  除外／エラー {1:N0}件  ·  結果はPC内に保存", count, excluded);
             if (!loading && !drives.Targets.Any()) UI<TextBlock>("ScanStatus").Text = "対象ドライブがありません。接続済みのドライブにチェックを付けてください。";
+            if (DateTime.UtcNow < feedbackUntil) UI<TextBlock>("ScanStatus").Text = feedbackMessage;
+            if (preferencesError.Length > 0) UI<TextBlock>("ScanStatus").Text = preferencesError;
             if (inventoryError.Length > 0) UI<TextBlock>("ScanStatus").Text = inventoryError;
-            UI<TextBlock>("ScanStatus").ToolTip = String.Join("\n", states.Where(s => s.Running).Select(s => s.Root + " " + s.CurrentPath));
+            var failedSaves = drives.Targets.Where(s => s.Status == "保存失敗").Select(s => s.Root).ToArray();
+            if (failedSaves.Length > 0) UI<TextBlock>("ScanStatus").Text = "結果を保存できませんでした: " + String.Join("、", failedSaves) + " · 除外・読取エラーで詳細を確認してください。";
+            var invalidCaches = drives.Targets.Where(s => s.Status == "保存結果が無効・再スキャンしてください").Select(s => s.Root).ToArray();
+            if (invalidCaches.Length > 0) UI<TextBlock>("ScanStatus").Text = "保存結果を読み込めませんでした: " + String.Join("、", invalidCaches) + " · 対象ドライブを再スキャンしてください。";
+            UI<TextBlock>("ScanStatus").ToolTip = UI<TextBlock>("ScanStatus").Text + "\n" + String.Join("\n", states.Where(s => s.Running).Select(s => s.Root + " " + s.CurrentPath));
             var totals = Totals(); long total = totals.Sum();
             foreach (var pair in categoryViews)
             {
                 int id = pair.Key; var v = pair.Value; long b = id < 0 ? total : totals[id];
-                v.Size.Text = Catalog.Size(b); v.Bar.Width = total == 0 ? 0 : Math.Min(234, 234.0 * b / total);
+                v.Size.Text = Catalog.Size(b); v.Bar.Width = total == 0 ? 0 : Math.Max(0, v.Track.ActualWidth * b / total);
                 long n = 0; foreach (var s in ActiveStates()) lock (s.Gate) n += id < 0 ? s.Files : s.Counts[id];
                 v.Count.Text = n.ToString("N0") + "ファイル · " + (total == 0 ? "0%" : ((double)b / total).ToString("P1"));
             }
@@ -413,6 +501,7 @@ namespace DriveScope
             UI<TextBlock>("DetailSummary").Text = selected == null ? "各ドライブを選ぶと、その中身を確認できます。" : selected.Running ? "走査中の値です。フォルダを掘り下げて確認できます。" : (selected.Files == 0 ? "スキャンするとフォルダ・ファイルを表示します。" : "集計日時 " + selected.Finished.ToString("yyyy/MM/dd HH:mm") + (selected.Complete ? " · 完了" : " · 途中結果"));
             if (comparing) UI<TextBlock>("DetailSummary").Text = drives.Targets.Count() + "ドライブを比較 · チェックを外すと集計から除外";
             if (dirty || (running > 0 && tick % 4 == 0)) RefreshDetails();
+            UpdateRevealAvailability();
         }
         List<DisplayRow> SetRows(DataGrid grid, List<DisplayRow> rows)
         {
@@ -450,9 +539,8 @@ namespace DriveScope
                     if (folder.Length > 0 && !folder.StartsWith(s.Root, StringComparison.OrdinalIgnoreCase)) continue;
                     string parent = folder.Length > 0 ? folder : s.Root;
                     FolderRecord parentRecord; if (s.Folders.TryGetValue(parent, out parentRecord)) parentBytes += category < 0 ? parentRecord.Total : parentRecord.Bytes[category];
-                    foreach (var f in s.Folders.Values)
+                    foreach (var f in s.GetChildFolders(parent))
                     {
-                        if (!String.Equals(f.Parent, parent, StringComparison.OrdinalIgnoreCase)) continue;
                         long bytes = category < 0 ? f.Total : f.Bytes[category]; if (bytes == 0) continue;
                         string name = Path.GetFileName(f.Path.TrimEnd('\\')); if (selected == null) name = s.Root.Substring(0, 2) + "  " + name;
                         folderRows.Add(new DisplayRow { Name = name, Path = f.Path, Bytes = bytes });
@@ -472,22 +560,24 @@ namespace DriveScope
             fileRows = fileRows.Where(filter).OrderByDescending(r => r.Bytes).ThenBy(r => r.Path).Take(300).ToList();
             issueRows = issueRows.Where(filter).ToList();
             folderRows = SetRows(UI<DataGrid>("Folders"), folderRows); fileRows = SetRows(UI<DataGrid>("Files"), fileRows); issueRows = SetRows(UI<DataGrid>("Issues"), issueRows);
-            UI<DataGrid>("Folders").ToolTip = "フォルダを選択して「エクスプローラーで表示」／ダブルクリックで中を表示";
+            UI<DataGrid>("Folders").ToolTip = "Enter／ダブルクリックで中を表示。Alt+↑で親へ。「エクスプローラーで表示」で場所を表示。";
             UI<DataGrid>("Files").ToolTip = "ドライブごと・カテゴリごとの上位100ファイルから表示。ダブルクリックで場所を表示。";
             UI<TextBlock>("FolderPath").Text = folder.Length > 0 ? folder : selected == null ? "全ドライブのルート" : selected.Root;
             UI<TextBlock>("FolderPath").ToolTip = UI<TextBlock>("FolderPath").Text;
             UI<Button>("Up").IsEnabled = folder.Length > 0;
             UI<TextBlock>("ListNote").Text = "フォルダ " + folderRows.Count.ToString("N0") + "件 · ファイルは各ドライブ・カテゴリの上位100件から抽出";
+            UpdateRevealAvailability();
         }
         void Reveal()
         {
-            var grid = UI<TabControl>("Tabs").SelectedIndex == 1 ? UI<DataGrid>("Files") : UI<DataGrid>("Folders");
+            int tab = UI<TabControl>("Tabs").SelectedIndex; if (tab != 0 && tab != 1) return;
+            var grid = tab == 1 ? UI<DataGrid>("Files") : UI<DataGrid>("Folders");
             var row = grid.SelectedItem as DisplayRow; string path = row == null ? folder : row.Path;
             if (String.IsNullOrEmpty(path)) return;
             try
             {
                 if (!Directory.Exists(path) && !File.Exists(path)) { MessageBox.Show(window, "このパスは現在存在しません。再スキャンしてください。", "DriveScope"); return; }
-                Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + path.Replace("\"", "") + "\"") { UseShellExecute = true });
+                Process.Start(new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"), "/select,\"" + path.Replace("\"", "") + "\"") { UseShellExecute = true });
             }
             catch (Exception ex) { MessageBox.Show(window, ex.Message, "場所を開けませんでした"); }
         }
@@ -507,13 +597,14 @@ namespace DriveScope
                 }
                 foreach (var r in folderRows) rows.Add(new[] { "表示中のフォルダ", Path.GetPathRoot(r.Path), category < 0 ? "すべて" : Catalog.Names[category], r.Path, r.Bytes.ToString(), "", "", "" });
                 foreach (var r in fileRows) rows.Add(new[] { "大きいファイル", Path.GetPathRoot(r.Path), r.Category, r.Path, r.Bytes.ToString(), "", "", "" });
-                Store.WriteCsv(dialog.FileName, rows); UI<TextBlock>("ScanStatus").Text = "CSVを書き出しました: " + dialog.FileName;
+                Store.WriteCsv(dialog.FileName, rows); feedbackMessage = "CSVを書き出しました: " + dialog.FileName; feedbackUntil = DateTime.UtcNow.AddSeconds(10); Refresh();
             }
             catch (Exception ex) { MessageBox.Show(window, ex.Message, "CSVを書き出せませんでした"); }
         }
         async void OnClosing(object sender, CancelEventArgs e)
         {
             if (closing) return;
+            searchTimer.Stop();
             if (workers.Any(t => !t.IsCompleted))
             {
                 e.Cancel = true; closing = true; timer.Stop(); window.IsEnabled = false;
@@ -534,8 +625,9 @@ namespace DriveScope
             if (args.Length > 1 && args[0] == "--verify-caches") return Verification.VerifyCaches(args[1]);
             if (args.Length > 1 && args[0] == "--migrate-legacy") return Verification.MigrateLegacy(args[1]);
             bool documentation = args.Length > 1 && args[0] == "--docs-screenshot";
+            string presentation = args.Length > 1 && args[0] == "--verify-presentation" ? args[1] : null;
             string screenshot = args.Length > 1 && (args[0] == "--screenshot" || documentation) ? args[1] : null;
-            using (var mutex = new Mutex(false, "Local\\DriveScope.CapacityViewer"))
+            using (var mutex = new Mutex(false, documentation || presentation != null ? "Local\\DriveScope.PresentationFixtures" : "Local\\DriveScope.CapacityViewer"))
             {
                 bool acquired = false; try { acquired = mutex.WaitOne(0); } catch (AbandonedMutexException) { acquired = true; }
                 if (!acquired) { MessageBox.Show("DriveScopeはすでに起動しています。タスクバーから開いてください。", "DriveScope"); return 0; }
@@ -546,7 +638,7 @@ namespace DriveScope
                     string live = args.Length > 1 && args[0] == "--verify-live" ? args[1] : null;
                     string uiVerify = args.Length > 1 && args[0] == "--verify-ui" ? args[1] : null;
                     string refreshVerify = args.Length > 1 && args[0] == "--verify-refresh" ? args[1] : null;
-                    var controller = new MainController(args.Contains("--scan") || live != null, screenshot, live, uiVerify, refreshVerify, documentation); app.Run(controller.Window);
+                    var controller = new MainController(args.Contains("--scan") || live != null, screenshot, live, uiVerify, refreshVerify, documentation, presentation); app.Run(controller.Window);
                     if (controller.VerificationFailed) return 1;
                 }
                 catch (Exception ex)

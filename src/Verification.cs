@@ -68,6 +68,8 @@ namespace DriveScope
                 Assert(csvBytes[0] == 239 && csvBytes[1] == 187 && csvBytes[2] == 191 && csvText.Contains("\"a,\"\"b\"\"\"") && csvText.Contains("改行\nあり"), "Excel UTF-8 BOM and CSV escaping", log);
                 VerifyDriveManagement(output, log);
                 VerifyIncrementalRows(log);
+                PerformanceVerification.Run(output, log);
+                SecurityVerification.Run(output, log);
                 log.Add("ALL CHECKS PASSED"); File.WriteAllLines(Path.Combine(output, "self-test.txt"), log); return 0;
             }
             catch (Exception ex) { log.Add(ex.ToString()); File.WriteAllLines(Path.Combine(output, "self-test.txt"), log); return 1; }
